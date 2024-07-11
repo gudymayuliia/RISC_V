@@ -1,36 +1,18 @@
 module risc_v(
     input  CLK,        // system clock 
     input  RESET,      // reset button
-    output [4:0] LEDS, // system LEDs
-    input  RXD,        // UART receive
-    output TXD         // UART transmit
+    output     [31:0] mem_addr, 
+    input      [31:0] mem_rdata, 
+    output 	      mem_rstrb,
+    output [31:0] mem_wdata,
+    output [3:0] mem_wmask,
+    output reg [31:0] x1       // UART transmit
 );
 
-   
-   reg [31:0] MEM [0:255]; //memory
    reg [31:0] PC;       // program counter
    reg [31:0] instr;    // current instruction
    
-   reg [4:0] leds;
-   assign LEDS = leds;
-   `include "risc_assembly.v"
-   //instuction decoder
-   initial begin
-      PC = 0;
-      ADD(x0,x0,x0);
-      ADD(x1,x0,x0);
-      ADDI(x1,x1,1);
-      ADDI(x1,x1,1);
-      ADDI(x1,x1,1);
-      ADDI(x1,x1,1);
-      ADD(x2,x1,x0);
-      ADD(x3,x1,x2);
-      SRLI(x3,x3,3);
-      SLLI(x3,x3,31);
-      SRAI(x3,x3,5);
-      SRLI(x1,x3,26);
-      EBREAK();
-   end
+   
 
    // The 10 RISC-V instructions
    wire isALUreg  =  (instr[6:0] == 7'b0110011); // rd <- rs1 OP rs2   
@@ -66,25 +48,65 @@ module risc_v(
    reg [31:0] rs2;
    wire [31:0] writeBackData;
    wire        writeBackEn;
-   assign writeBackData = 0; // for now
-   assign writeBackEn = 0;   // for now
    
+   //load instructions
+   wire [31:0] loadstore_addr = rs1 + (isStore? Simm :Iimm);
+   wire [15:0] LOAD_halfword =
+	       loadstore_addr[1] ? mem_rdata[31:16] : mem_rdata[15:0];
+
+   wire  [7:0] LOAD_byte =
+	       loadstore_addr[0] ? LOAD_halfword[15:8] : LOAD_halfword[7:0];
+   //selecting among load word/halfword/byte
+   wire mem_byteAccess     = funct3[1:0] == 2'b00;
+   wire mem_halfwordAccess = funct3[1:0] == 2'b01;
+
+   wire [31:0] LOAD_data =
+         mem_byteAccess ? LOAD_byte     :
+     mem_halfwordAccess ? LOAD_halfword :
+                          mem_rdata     ;
+   //sign expansion                       
+   wire LOAD_sign = !funct3[2] & (mem_byteAccess ? LOAD_byte[7] : LOAD_halfword[15]);
+
+   wire [31:0] LOAD_data =
+         mem_byteAccess ? {{24{LOAD_sign}},     LOAD_byte} :
+     mem_halfwordAccess ? {{16{LOAD_sign}}, LOAD_halfword} :
+                          mem_rdata ;
    // The ALU
    wire [31:0] aluIn1 = rs1; //first input
-   wire [31:0] aluIn2 = isALUreg ? rs2 : Iimm; //second input, register or immidiate value
-   reg [31:0] aluOut; //store the computed value
+   wire [31:0] aluIn2 = isALUreg | isBranch ? rs2 : Iimm; //second input, register or immidiate value
    wire [4:0] shamt = isALUreg ? rs2[4:0] : instr[24:20]; // shift amount
-
+   reg [31:0]  aluOut;
+   wire [31:0] aluPlus = aluIn1 + aluIn2;
+   wire [32:0] aluMinus = {1'b1, ~aluIn2} + {1'b0,aluIn1} + 33'b1;
+   wire        LT  = (aluIn1[31] ^ aluIn2[31]) ? aluIn1[31] : aluMinus[32];
+   wire        LTU = aluMinus[32];
+   wire        EQ  = (aluMinus[31:0] == 0);
+   
+   
    always @(*) begin
       case(funct3)
-	3'b000: aluOut = (funct7[5] & instr[5]) ? (aluIn1 - aluIn2) : (aluIn1 + aluIn2); //sub or add, depends on func7
+	3'b000: aluOut = (funct7[5] & instr[5]) ? aluMinus[31:0] : aluPlus; //sub or add, depends on func7
 	3'b001: aluOut = aluIn1 << shamt; //left shift
-	3'b010: aluOut = ($signed(aluIn1) < $signed(aluIn2)); //signed comparison
-	3'b011: aluOut = (aluIn1 < aluIn2);//unsigned comparison
+	3'b010: aluOut = {31'b0, LT}; //signed comparison
+	3'b011: aluOut = {31'b0, LTU};//unsigned comparison
 	3'b100: aluOut = (aluIn1 ^ aluIn2); //xor
 	3'b101: aluOut = funct7[5]? ($signed(aluIn1) >>> shamt) : ($signed(aluIn1) >> shamt); //arithmetic/logical right shift
 	3'b110: aluOut = (aluIn1 | aluIn2); //or
 	3'b111: aluOut = (aluIn1 & aluIn2);	//and
+      endcase
+   end
+   
+   // branch instructions
+      reg takeBranch;
+   always @(*) begin
+      case(funct3)
+	3'b000: takeBranch = EQ; //BEQ
+	3'b001: takeBranch = !EQ; //BNE
+	3'b100: takeBranch = LT; //BLT
+	3'b101: takeBranch = !LT; //BGE
+	3'b110: takeBranch = LTU; //BLTU
+	3'b111: takeBranch = !LTU; // BGEU
+	default: takeBranch = 1'b0;
       endcase
    end
    
@@ -93,32 +115,67 @@ module risc_v(
    //fetching the values of source registers 
    //computing source registers based on operation
    
+   wire [31:0] PCplusImm = PC + ( instr[3] ? Jimm[31:0] :
+				  instr[4] ? Uimm[31:0] :
+				             Bimm[31:0] );
+   wire [31:0] PCplus4 = PC+4;
+   
    localparam FETCH_INSTR = 0;
-   localparam FETCH_REGS  = 1;
-   localparam EXECUTE     = 2;
+   localparam WAIT_INSTR  = 1;
+   localparam FETCH_REGS  = 2;
+   localparam EXECUTE     = 3;
+   localparam LOAD = 4;
+   localparam WAIT_DATA = 5;
+   localparam STORE = 6;
+   
    reg [1:0] state = FETCH_INSTR;
    
+   assign writeBackData = (isJAL || isJALR) ? PCplus4 :
+			      isLUI         ? Uimm :
+			      isAUIPC       ? PCplusImm : 
+			                      aluOut;
    
-   assign writeBackData = aluOut; 
-   assign writeBackEn = (state == EXECUTE && (isALUreg || isALUimm));
+   assign writeBackEn = (state == EXECUTE && !isBranch && !isStore && !isLoad) || (store ==WAIT_DATA);
    
+   wire [31:0] nextPC = ((isBranch && takeBranch) || isJAL) ? PCplusImm  :	       
+	                isJALR                              ? {aluPlus[31:1],1'b0}:
+	                PCplus4;
+   
+   assign mem_wdata[ 7: 0] = rs2[7:0];
+   assign mem_wdata[15: 8] = loadstore_addr[0] ? rs2[7:0]  : rs2[15: 8];
+   assign mem_wdata[23:16] = loadstore_addr[1] ? rs2[7:0]  : rs2[23:16];
+   assign mem_wdata[31:24] = loadstore_addr[0] ? rs2[7:0]  :
+			     loadstore_addr[1] ? rs2[15:8] : rs2[31:24];
+			 
+			 
+    wire [3:0] STORE_wmask =
+	      mem_byteAccess      ?
+	            (loadstore_addr[1] ?
+		          (loadstore_addr[0] ? 4'b1000 : 4'b0100) :
+		          (loadstore_addr[0] ? 4'b0010 : 4'b0001)
+                    ) :
+	      mem_halfwordAccess ?
+	            (loadstore_addr[1] ? 4'b1100 : 4'b0011) :
+              4'b1111;
    //implementing 4th step - storing the reult in destination register
    always @(posedge clk) begin
       if(RESET) begin
 	   PC    <= 0;
 	   state <= FETCH_INSTR;
-	   instr <= 32'b0000000_00000_00000_000_00000_0110011; // NOP
       end 
       else begin
 	   if(writeBackEn && rdId != 0) begin
 	   RegisterBank[rdId] <= writeBackData;
 	 end
-   
+
     //state machine
 	 case(state)
 	   FETCH_INSTR: begin
-	      instr <= MEM[PC[31:2]];
-	      state <= FETCH_REGS;
+	      state <= WAIT_INSTR;
+	   end
+	   WAIT_INSTR: begin
+	   instr <= mem_rdata;
+	   state <= FETCH_REGS;
 	   end
 	   FETCH_REGS: begin
 	      rs1 <= RegisterBank[rs1Id];
@@ -126,12 +183,27 @@ module risc_v(
 	      state <= EXECUTE;
 	   end
 	   EXECUTE: begin
-	      PC <= PC + 4;
+	      PC <= nextPC;
 	      state <= FETCH_INSTR;	      
+	   end
+	   LOAD: begin
+	       state <= WAIT_DATA;
+	   end
+	   WAIT_DATA: begin
+	       state <= FETCH_INSTR;
+	   end
+	   STORE: begin
+	       state <= FETCH_INSTR;
 	   end
 	 endcase
       end 
    end 
+   
+   assign mem_addr = (state == WAIT_INSTR || state == FETCH_INSTR) ? PC : loadstore_addr;
+   assign mem_rstrb = (state == FETCH_INSTR || state == LOAD);
+   assign mem_wmask = {4{(state == STORE)}} & STORE_wmask;
+   
+   
    
 
    assign TXD  = 1'b0; // not used for now   
